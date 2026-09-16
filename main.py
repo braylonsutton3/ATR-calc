@@ -14,7 +14,7 @@ SYMBOLS = {
 STOP_ATR_MULTIPLE = 0.75
 TARGET_R_MULTIPLE = 3.0
 MIN_MARKET_RISK = 30.0
-MAX_TOTAL_LOSS = 200.0
+MAX_TOTAL_LOSS = 450.0
 
 
 st.set_page_config(page_title="Strategy 1 Dollar Calculator", page_icon="🧮")
