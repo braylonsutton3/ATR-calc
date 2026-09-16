@@ -1,68 +1,154 @@
+from datetime import datetime, time
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
 import streamlit as st
+import yfinance as yf
 
 
-# Dollars gained or lost from a 1.00-point move in one contract.
-SYMBOLS = {
-    "MNQ": {"name": "Micro E-mini Nasdaq-100", "point_value": 2.00},
-    "MES": {"name": "Micro E-mini S&P 500", "point_value": 5.00},
-    "MGC": {"name": "Micro Gold", "point_value": 10.00},
-    "MYM": {"name": "Micro E-mini Dow", "point_value": 0.50},
-    "M2K": {"name": "Micro E-mini Russell 2000", "point_value": 5.00},
-    "MCL": {"name": "Micro WTI Crude Oil", "point_value": 100.00},
-}
+st.set_page_config(page_title="MNQ ATR Calculator", page_icon="⚡", layout="wide")
 
+SYMBOL = "MNQ=F"
+CONTRACTS = 8
+POINT_VALUE = 2.00
 STOP_ATR_MULTIPLE = 0.75
-TARGET_R_MULTIPLE = 3.0
-MIN_MARKET_RISK = 30.0
-MAX_TOTAL_LOSS = 450.0
+TARGET_ATR_MULTIPLE = 2.25
+MAX_RISK = 450.00
+MIN_ATR = 0.00
+MAX_ATR = MAX_RISK / (CONTRACTS * POINT_VALUE * STOP_ATR_MULTIPLE)
+ET = ZoneInfo("America/New_York")
 
 
-st.set_page_config(page_title="Strategy 1 Dollar Calculator", page_icon="🧮")
-st.title("Strategy 1 Dollar Risk Calculator")
-st.caption("No live price is required · Stop = 0.75 ATR · Target = 3R")
-
-symbol = st.selectbox("Micro futures symbol", list(SYMBOLS))
-atr = st.number_input("Current ATR(14)", min_value=0.0, value=6.83, step=0.01, format="%.4f")
-contracts = st.number_input("Number of contracts", min_value=1, value=3, step=1)
-round_trip_cost = st.number_input(
-    "Estimated total fees and commissions ($)", min_value=0.0, value=12.00, step=0.01
-)
-
-point_value = SYMBOLS[symbol]["point_value"]
-stop_distance_points = atr * STOP_ATR_MULTIPLE
-
-# These results work the same for LONG and SHORT market/limit entries.
-market_risk = stop_distance_points * point_value * contracts
-total_loss_if_stopped = market_risk + round_trip_cost
-gross_profit_target = market_risk * TARGET_R_MULTIPLE
-estimated_net_profit = gross_profit_target - round_trip_cost
-breakeven_trigger_profit = market_risk
-
-st.subheader("Amounts to enter")
-c1, c2 = st.columns(2)
-c1.metric("Stop-loss amount", f"${market_risk:,.2f}")
-c2.metric("Take-profit amount", f"${gross_profit_target:,.2f}")
-
-st.subheader("Additional information")
-c1, c2, c3 = st.columns(3)
-c1.metric("Loss including costs", f"${total_loss_if_stopped:,.2f}")
-c2.metric("Estimated net at target", f"${estimated_net_profit:,.2f}")
-c3.metric("Move stop to breakeven after", f"+${breakeven_trigger_profit:,.2f}")
-
-st.write(f"**ATR stop distance:** {stop_distance_points:,.2f} points")
-st.write(f"**Position value:** ${point_value * contracts:,.2f} per point")
-
-if total_loss_if_stopped > MAX_TOTAL_LOSS:
-    st.error(
-        f"SKIP OR USE FEWER CONTRACTS: estimated loss including costs is above "
-        f"the ${MAX_TOTAL_LOSS:.0f} Strategy 1 limit."
+@st.cache_data(ttl=20, show_spinner=False)
+def get_mnq_data() -> pd.DataFrame:
+    df = yf.download(
+        SYMBOL,
+        period="7d",
+        interval="1m",
+        auto_adjust=False,
+        progress=False,
+        prepost=True,
+        threads=False,
     )
-elif market_risk < MIN_MARKET_RISK:
-    st.warning(f"SKIP: market risk is below the ${MIN_MARKET_RISK:.0f} Strategy 1 minimum.")
-else:
-    st.success("Risk is inside the Strategy 1 range.")
+    if df.empty:
+        return df
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+    df.index = df.index.tz_convert(ET)
+    return df.sort_index()
 
-st.info(
-    "Use these dollar amounts with either a market or limit entry. No current market "
-    "price is required. Actual loss can be larger during slippage, gaps, or fast markets."
+
+def morning_bias(df: pd.DataFrame) -> str:
+    """Bias from completed 1-minute MNQ bars labeled 09:30 through 09:58 ET only."""
+    if df.empty:
+        return "WAIT"
+
+    today = datetime.now(ET).date()
+    bars = df[
+        (df.index.date == today)
+        & (df.index.time >= time(9, 30))
+        & (df.index.time <= time(9, 58))
+    ].dropna(subset=["Open", "High", "Low", "Close", "Volume"])
+
+    # Require nearly the whole completed window so partial/stale data cannot set bias.
+    if len(bars) < 27 or bars.index[-1].time() < time(9, 58):
+        return "WAIT"
+
+    close = bars["Close"].astype(float)
+    open_ = bars["Open"].astype(float)
+    high = bars["High"].astype(float)
+    low = bars["Low"].astype(float)
+    volume = bars["Volume"].astype(float)
+
+    typical = (high + low + close) / 3.0
+    vwap = float((typical * volume).sum() / volume.sum()) if volume.sum() > 0 else float(typical.mean())
+    slope = float(np.polyfit(np.arange(len(close), dtype=float), close.to_numpy(), 1)[0])
+    net_move = float(close.iloc[-1] - open_.iloc[0])
+    up_volume = float(volume.where(close > open_, 0.0).sum())
+    down_volume = float(volume.where(close < open_, 0.0).sum())
+
+    votes = [
+        1 if net_move > 0 else -1 if net_move < 0 else 0,
+        1 if close.iloc[-1] > vwap else -1 if close.iloc[-1] < vwap else 0,
+        1 if slope > 0 else -1 if slope < 0 else 0,
+        1 if up_volume > down_volume else -1 if down_volume > up_volume else 0,
+        1 if (close.diff().dropna() > 0).sum() > (close.diff().dropna() < 0).sum() else -1,
+    ]
+    score = sum(votes)
+    if score >= 3:
+        return "LONG"
+    if score <= -3:
+        return "SHORT"
+    return "WAIT"
+
+
+def money(value: float, signed: bool = False) -> str:
+    if signed:
+        sign = "+" if value >= 0 else "−"
+        return f"{sign}${abs(value):,.2f}"
+    return f"${value:,.2f}"
+
+
+st.markdown(
+    """
+    <style>
+      .block-container {max-width: 1120px; padding-top: 1.3rem; padding-bottom: 1rem;}
+      div[data-testid="stMetric"] {background:#111827; border:1px solid #263244; border-radius:14px; padding:14px;}
+      div[data-testid="stMetricLabel"] {font-size:.82rem;}
+      div[data-testid="stMetricValue"] {font-size:1.65rem;}
+      .signal {text-align:center; padding:16px; border-radius:14px; font-size:2rem; font-weight:800; margin:.35rem 0 1rem;}
+      .long {background:#063d2b; color:#5cffbd; border:1px solid #087b54;}
+      .short {background:#4a171d; color:#ff8792; border:1px solid #94303b;}
+      .wait {background:#3b3212; color:#ffe070; border:1px solid #78651c;}
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
+
+st.title("MNQ ATR Calculator")
+st.caption("8 contracts · $450 maximum risk · 0.75× ATR stop · 3R target")
+
+try:
+    market_data = get_mnq_data()
+    bias = morning_bias(market_data)
+except Exception:
+    bias = "WAIT"
+
+signal_class = {"LONG": "long", "SHORT": "short", "WAIT": "wait"}[bias]
+st.markdown(f'<div class="signal {signal_class}">{bias}</div>', unsafe_allow_html=True)
+
+top1, top2, top3 = st.columns(3)
+top1.metric("Contracts", CONTRACTS)
+top2.metric("Minimum ATR", f"{MIN_ATR:.2f}")
+top3.metric("Maximum ATR", f"{MAX_ATR:.2f}")
+
+atr = st.number_input(
+    "Locked ATR(14) through 9:59",
+    min_value=0.0,
+    value=0.0,
+    step=0.01,
+    format="%.2f",
+)
+
+valid = MIN_ATR <= atr <= MAX_ATR and atr > 0 and bias in ("LONG", "SHORT")
+stop_distance = STOP_ATR_MULTIPLE * atr
+target_distance = TARGET_ATR_MULTIPLE * atr
+risk = stop_distance * POINT_VALUE * CONTRACTS
+reward = target_distance * POINT_VALUE * CONTRACTS
+breakeven_trigger_dollars = risk
+
+status = "TRADE" if valid else "WAIT"
+st.subheader(status)
+
+r1, r2, r3 = st.columns(3)
+r1.metric("Take profit", money(reward, signed=True))
+r2.metric("Stop loss", money(-risk, signed=True))
+r3.metric("Move stop to breakeven at", money(breakeven_trigger_dollars, signed=True))
+
+if atr > MAX_ATR:
+    st.error(f"WAIT — ATR exceeds {MAX_ATR:.2f}; planned risk is above {money(MAX_RISK)}.")
+elif bias == "WAIT":
+    st.warning("WAIT")
